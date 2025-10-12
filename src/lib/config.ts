@@ -130,6 +130,11 @@ export function refineConfig(adminConfig: AdminConfig): AdminConfig {
   // 将 Map 转换回数组
   adminConfig.CustomCategories = Array.from(customCategoriesMap.values());
 
+  // 同步 cache_time 到 SiteConfig.SiteInterfaceCacheTime
+  if (fileConfig.cache_time !== undefined) {
+    adminConfig.SiteConfig.SiteInterfaceCacheTime = fileConfig.cache_time;
+  }
+
   return adminConfig;
 }
 
@@ -273,7 +278,20 @@ async function initConfig() {
           });
         }
       } else {
-        fileConfig = {} as ConfigFileStruct;
+        // 数据库中没有配置，使用默认的运行时配置
+        if (process.env.DOCKER_ENV === 'true') {
+          // eslint-disable-next-line @typescript-eslint/no-implied-eval
+          const _require = eval('require') as NodeJS.Require;
+          const fs = _require('fs') as typeof import('fs');
+          const path = _require('path') as typeof import('path');
+
+          const configPath = path.join(process.cwd(), 'config.json');
+          const raw = fs.readFileSync(configPath, 'utf-8');
+          fileConfig = JSON.parse(raw) as ConfigFileStruct;
+        } else {
+          // 默认使用编译时生成的配置
+          fileConfig = runtimeConfig as unknown as ConfigFileStruct;
+        }
         // 数据库中没有配置，创建新的管理员配置
         let allUsers = userNames.map((uname) => ({
           username: uname,
@@ -288,7 +306,7 @@ async function initConfig() {
           });
         }
         adminConfig = {
-          ConfigFile: '',
+          ConfigFile: JSON.stringify(fileConfig),
           SiteConfig: {
             SiteName: process.env.NEXT_PUBLIC_SITE_NAME || 'MoonTV',
             Announcement:
@@ -304,14 +322,29 @@ async function initConfig() {
               process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE || 'direct',
             DoubanImageProxy: process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '',
             DisableYellowFilter:
-              process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
+          process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
+        TVBoxEnabled: false,
+        TVBoxPassword: '',
           },
           UserConfig: {
             AllowRegister: process.env.NEXT_PUBLIC_ENABLE_REGISTER === 'true',
             Users: allUsers as any,
           },
-          SourceConfig: [],
-          CustomCategories: [],
+          SourceConfig: Object.entries(fileConfig.api_site || {}).map(([key, site]) => ({
+            key,
+            name: site.name,
+            api: site.api,
+            detail: site.detail,
+            from: 'config',
+            disabled: false,
+          })),
+          CustomCategories: (fileConfig.custom_category || []).map((category) => ({
+            name: category.name,
+            type: category.type,
+            query: category.query,
+            from: 'config',
+            disabled: false,
+          })),
         };
       }
   
@@ -343,6 +376,8 @@ async function initConfig() {
         DoubanImageProxy: process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '',
         DisableYellowFilter:
           process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
+        TVBoxEnabled: false,
+        TVBoxPassword: '',
       },
       UserConfig: {
         AllowRegister: process.env.NEXT_PUBLIC_ENABLE_REGISTER === 'true',
@@ -411,6 +446,23 @@ export async function getConfig(): Promise<AdminConfig> {
       typeof adminConfig.SiteConfig.DisableYellowFilter === 'boolean'
         ? adminConfig.SiteConfig.DisableYellowFilter
         : process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true';
+    // TVBox 开关与密码默认值
+    const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
+    if (storageType === 'localstorage') {
+      const raw = process.env.TVBOX_ENABLED;
+      adminConfig.SiteConfig.TVBoxEnabled =
+        raw == null ? true : String(raw).toLowerCase() === 'true';
+      adminConfig.SiteConfig.TVBoxPassword = process.env.PASSWORD || '';
+    } else {
+      adminConfig.SiteConfig.TVBoxEnabled =
+        typeof adminConfig.SiteConfig.TVBoxEnabled === 'boolean'
+          ? adminConfig.SiteConfig.TVBoxEnabled
+          : false;
+      adminConfig.SiteConfig.TVBoxPassword =
+        typeof adminConfig.SiteConfig.TVBoxPassword === 'string'
+          ? adminConfig.SiteConfig.TVBoxPassword
+          : '';
+    }
 
     try {
       fileConfig = JSON.parse(adminConfig.ConfigFile) as ConfigFileStruct;
@@ -497,6 +549,11 @@ export async function getConfig(): Promise<AdminConfig> {
 
     // 将 Map 转换回数组
     adminConfig.CustomCategories = Array.from(customCategoriesMap.values());
+
+    // 同步 cache_time 到 SiteConfig.SiteInterfaceCacheTime
+    if (fileConfig.cache_time !== undefined) {
+      adminConfig.SiteConfig.SiteInterfaceCacheTime = fileConfig.cache_time;
+    }
 
     const ownerUser = process.env.USERNAME || '';
     // 检查配置中的站长用户是否和 USERNAME 匹配，如果不匹配则降级为普通用户
@@ -586,6 +643,8 @@ export async function resetConfig() {
       DoubanImageProxy: process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '',
       DisableYellowFilter:
         process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
+        TVBoxEnabled: false,
+        TVBoxPassword: '',
     },
     UserConfig: {
       AllowRegister: process.env.NEXT_PUBLIC_ENABLE_REGISTER === 'true',

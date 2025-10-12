@@ -1,9 +1,6 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment, @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps, no-console, @next/next/no-img-element */
 
 'use client';
-
-import Artplayer from 'artplayer';
-import Hls from 'hls.js';
 import { Heart } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
@@ -22,7 +19,7 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
-import { getRequestTimeout,getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
+import { getRequestTimeout,getVideoResolutionFromM3u8 } from '@/lib/utils';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
@@ -112,7 +109,7 @@ function PlayPageClient() {
   const [searchType] = useState(searchParams.get('stype') || '');
 
   // 是否需要优选
-  const [needPrefer, setNeedPrefer] = useState(
+  const [needPrefer, _setNeedPrefer] = useState(
     searchParams.get('prefer') === 'true'
   );
   const needPreferRef = useRef(needPrefer);
@@ -170,10 +167,6 @@ function PlayPageClient() {
   const [precomputedVideoInfo, setPrecomputedVideoInfo] = useState<
     Map<string, { quality: string; loadSpeed: string; pingTime: number }>
   >(new Map());
-
-  // 折叠状态（仅在 lg 及以上屏幕有效）
-  const [isEpisodeSelectorCollapsed, setIsEpisodeSelectorCollapsed] =
-    useState(false);
 
   // 换源加载状态
   const [isVideoLoading, setIsVideoLoading] = useState(true);
@@ -602,35 +595,7 @@ function PlayPageClient() {
     }
   };
 
-  class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
-    constructor(config: any) {
-      super(config);
-      const load = this.load.bind(this);
-      this.load = function (context: any, config: any, callbacks: any) {
-        // 拦截manifest和level请求
-        if (
-          (context as any).type === 'manifest' ||
-          (context as any).type === 'level'
-        ) {
-          const onSuccess = callbacks.onSuccess;
-          callbacks.onSuccess = function (
-            response: any,
-            stats: any,
-            context: any
-          ) {
-            // 如果是m3u8文件，处理内容以移除广告分段
-            if (response.data && typeof response.data === 'string') {
-              // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-              response.data = filterAdsFromM3U8(response.data);
-            }
-            return onSuccess(response, stats, context, null);
-          };
-        }
-        // 执行原始load方法
-        load(context, config, callbacks);
-      };
-    }
-  }
+  // 注意：自定义 HLS Loader 会在确保 Hls 动态加载成功后再定义
 
   // 当集数索引变化时自动更新视频地址
   useEffect(() => {
@@ -639,27 +604,7 @@ function PlayPageClient() {
 
   // 进入页面时直接获取全部源信息
   useEffect(() => {
-    const fetchSourceDetail = async (
-      source: string,
-      id: string
-    ): Promise<SearchResult[]> => {
-      try {
-        const detailResponse = await fetch(
-          `/api/detail?source=${source}&id=${id}`
-        );
-        if (!detailResponse.ok) {
-          throw new Error('获取视频详情失败');
-        }
-        const detailData = (await detailResponse.json()) as SearchResult;
-        setAvailableSources([detailData]);
-        return [detailData];
-      } catch (err) {
-        console.error('获取视频详情失败:', err);
-        return [];
-      } finally {
-        setSourceSearchLoading(false);
-      }
-    };
+    // 已不再使用的函数移除（避免 SSR 与 linter 报错）
     
     const fetchSourcesData = async (
       query: string,
@@ -674,7 +619,7 @@ function PlayPageClient() {
         // 发起流式搜索请求
         const timeoutSeconds = getRequestTimeout();
         const response = await fetch(
-          `/api/search?q=${encodeURIComponent(query.trim())}&timeout=${timeoutSeconds}`
+          `/api/search?q=${encodeURIComponent(query.trim())}&timeout=${timeoutSeconds}&stream=1`
         );
         if (!response.ok) throw new Error('搜索失败');
   
@@ -1271,15 +1216,37 @@ function PlayPageClient() {
     }
   };
 
+  // 动态加载播放器相关库，仅在客户端
+  const artLibRef = useRef<any>(null);
+  const hlsLibRef = useRef<any>(null);
+  const [libsReady, setLibsReady] = useState(false);
+
   useEffect(() => {
-    if (
-      !Artplayer ||
-      !Hls ||
-      !videoUrl ||
-      loading ||
-      currentEpisodeIndex === null ||
-      !artRef.current
-    ) {
+    let mounted = true;
+    (async () => {
+      try {
+        const [{ default: Art }, { default: Hls }] = await Promise.all([
+          import('artplayer'),
+          import('hls.js'),
+        ]);
+        if (!mounted) return;
+        artLibRef.current = Art;
+        hlsLibRef.current = Hls;
+        setLibsReady(true);
+      } catch (err) {
+        console.error('加载播放器库失败:', err);
+        setLibsReady(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const Artplayer = artLibRef.current;
+    const Hls = hlsLibRef.current;
+    if (!libsReady || !Artplayer || !Hls || !videoUrl || loading || currentEpisodeIndex === null || !artRef.current) {
       return;
     }
 
@@ -1330,6 +1297,26 @@ function PlayPageClient() {
       // 创建新的播放器实例
       Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
       Artplayer.USE_RAF = true;
+
+      // 在这里定义自定义 Loader，确保 Hls 已就绪
+      class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
+        constructor(config: any) {
+          super(config);
+          const load = this.load.bind(this);
+          this.load = function (context: any, config: any, callbacks: any) {
+            if ((context as any).type === 'manifest' || (context as any).type === 'level') {
+              const onSuccess = callbacks.onSuccess;
+              callbacks.onSuccess = function (response: any, stats: any, context: any) {
+                if (response.data && typeof response.data === 'string') {
+                  response.data = filterAdsFromM3U8(response.data);
+                }
+                return onSuccess(response, stats, context, null);
+              };
+            }
+            load(context, config, callbacks);
+          };
+        }
+      }
 
       artPlayerRef.current = new Artplayer({
         container: artRef.current,
@@ -1387,9 +1374,7 @@ function PlayPageClient() {
               maxBufferSize: 60 * 1000 * 1000, // 约 60MB，超出后触发清理
 
               /* 自定义loader */
-              loader: blockAdEnabledRef.current
-                ? CustomHlsJsLoader
-                : Hls.DefaultConfig.loader,
+              loader: blockAdEnabledRef.current ? CustomHlsJsLoader : Hls.DefaultConfig.loader,
             });
 
             hls.loadSource(url);
@@ -1454,7 +1439,7 @@ function PlayPageClient() {
             name: '跳过片头片尾',
             html: '跳过片头片尾',
             switch: skipConfigRef.current.enable,
-            onSwitch: function (item) {
+            onSwitch: function (item: any) {
               const newConfig = {
                 ...skipConfigRef.current,
                 enable: !item.switch,
@@ -1696,7 +1681,7 @@ function PlayPageClient() {
       console.error('创建播放器失败:', err);
       setError('播放器初始化失败');
     }
-  }, [Artplayer, Hls, videoUrl, loading, blockAdEnabled]);
+  }, [libsReady, videoUrl, loading, blockAdEnabled, currentEpisodeIndex, detail]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
@@ -1876,83 +1861,21 @@ function PlayPageClient() {
 
   return (
     <PageLayout activePath='/play'>
-      <div className='flex flex-col gap-3 py-4 px-5 lg:px-[3rem] 2xl:px-20'>
-        {/* 第一行：影片标题 */}
-        <div className='py-1'>
-          <h1 className='text-xl font-semibold text-gray-900 dark:text-gray-100'>
-            {videoTitle || '影片标题'}
-            {totalEpisodes > 1 && (
-              <span className='text-gray-500 dark:text-gray-400'>
-                {` > 第 ${currentEpisodeIndex + 1} 集`}
-              </span>
-            )}
-          </h1>
-        </div>
-        {/* 第二行：播放器和选集 */}
+      <div className='flex flex-col gap-3 py-4 px-0 lg:px-[5rem] 2xl:px-32'>
+        {/* 播放器和选集 */}
         <div className='space-y-2'>
-          {/* 折叠控制 - 仅在 lg 及以上屏幕显示 */}
-          <div className='hidden lg:flex justify-end'>
-            <button
-              onClick={() =>
-                setIsEpisodeSelectorCollapsed(!isEpisodeSelectorCollapsed)
-              }
-              className='group relative flex items-center space-x-1.5 px-3 py-1.5 rounded-full bg-white/80 hover:bg-white dark:bg-gray-800/80 dark:hover:bg-gray-800 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50 shadow-sm hover:shadow-md transition-all duration-200'
-              title={
-                isEpisodeSelectorCollapsed ? '显示选集面板' : '隐藏选集面板'
-              }
-            >
-              <svg
-                className={`w-3.5 h-3.5 text-gray-500 dark:text-gray-400 transition-transform duration-200 ${
-                  isEpisodeSelectorCollapsed ? 'rotate-180' : 'rotate-0'
-                }`}
-                fill='none'
-                stroke='currentColor'
-                viewBox='0 0 24 24'
-              >
-                <path
-                  strokeLinecap='round'
-                  strokeLinejoin='round'
-                  strokeWidth='2'
-                  d='M9 5l7 7-7 7'
-                />
-              </svg>
-              <span className='text-xs font-medium text-gray-600 dark:text-gray-300'>
-                {isEpisodeSelectorCollapsed ? '显示' : '隐藏'}
-              </span>
-
-              {/* 精致的状态指示点 */}
-              <div
-                className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full transition-all duration-200 ${
-                  isEpisodeSelectorCollapsed
-                    ? 'bg-orange-400 animate-pulse'
-                    : 'bg-green-400'
-                }`}
-              ></div>
-            </button>
-          </div>
-
-          <div
-            className={`grid gap-4 lg:h-[500px] xl:h-[650px] 2xl:h-[750px] transition-all duration-300 ease-in-out ${
-              isEpisodeSelectorCollapsed
-                ? 'grid-cols-1'
-                : 'grid-cols-1 md:grid-cols-4'
-            }`}
-          >
+          <div className='grid gap-4 lg:h-[500px] xl:h-[650px] 2xl:h-[750px] grid-cols-1 md:grid-cols-4'>
             {/* 播放器 */}
-            <div
-              className={`h-full transition-all duration-300 ease-in-out rounded-xl border border-white/0 dark:border-white/30 ${
-                isEpisodeSelectorCollapsed ? 'col-span-1' : 'md:col-span-3'
-              }`}
-            >
+            <div className='h-full md:rounded-xl border-0 md:border md:border-white/0 md:dark:border-white/30 md:col-span-3'>
               <div className='relative w-full h-[300px] lg:h-full'>
                 <div
                   ref={artRef}
-                  className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg'
+                  className='bg-black w-full h-full md:rounded-xl overflow-hidden shadow-lg'
                 ></div>
 
                 {/* 换源加载蒙层 */}
                 {isVideoLoading && (
-                  <div className='absolute inset-0 bg-black/85 backdrop-blur-sm rounded-xl flex items-center justify-center z-[500] transition-all duration-300'>
+                  <div className='absolute inset-0 bg-black/85 backdrop-blur-sm md:rounded-xl flex items-center justify-center z-[500] transition-all duration-300'>
                     <div className='text-center max-w-md mx-auto px-6'>
                       {/* 动画影院图标 */}
                       <div className='relative mb-8'>
@@ -1992,14 +1915,8 @@ function PlayPageClient() {
               </div>
             </div>
 
-            {/* 选集和换源 - 在移动端始终显示，在 lg 及以上可折叠 */}
-            <div
-              className={`h-[300px] lg:h-full md:overflow-hidden transition-all duration-300 ease-in-out ${
-                isEpisodeSelectorCollapsed
-                  ? 'md:col-span-1 lg:hidden lg:opacity-0 lg:scale-95'
-                  : 'md:col-span-1 lg:opacity-100 lg:scale-100'
-              }`}
-            >
+            {/* 选集和换源 */}
+            <div className='h-[300px] lg:h-full md:overflow-hidden md:col-span-1'>
               <EpisodeSelector
                 totalEpisodes={totalEpisodes}
                 episodes_titles={detail?.episodes_titles || []}
@@ -2023,13 +1940,18 @@ function PlayPageClient() {
         </div>
 
         {/* 详情展示 */}
-        <div className='grid grid-cols-1 md:grid-cols-4 gap-4'>
+        <div className='grid grid-cols-1 gap-4'>
           {/* 文字区 */}
-          <div className='md:col-span-3'>
+          <div className='w-full'>
             <div className='p-6 flex flex-col min-h-0'>
               {/* 标题 */}
               <h1 className='text-3xl font-bold mb-2 tracking-wide flex items-center flex-shrink-0 text-center md:text-left w-full'>
                 {videoTitle || '影片标题'}
+                {totalEpisodes > 1 && (
+                  <span className='text-gray-500 dark:text-gray-400 text-2xl ml-3'>
+                    第 {currentEpisodeIndex + 1} 集
+                  </span>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -2039,6 +1961,31 @@ function PlayPageClient() {
                 >
                   <FavoriteIcon filled={favorited} />
                 </button>
+                {/* 豆瓣链接按钮 */}
+                {videoDoubanId !== 0 && (
+                  <a
+                    href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='ml-3 flex-shrink-0'
+                  >
+                    <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
+                      <svg
+                        width='16'
+                        height='16'
+                        viewBox='0 0 24 24'
+                        fill='none'
+                        stroke='currentColor'
+                        strokeWidth='2'
+                        strokeLinecap='round'
+                        strokeLinejoin='round'
+                      >
+                        <path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'></path>
+                        <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'></path>
+                      </svg>
+                    </div>
+                  </a>
+                )}
               </h1>
 
               {/* 关键信息行 */}
@@ -2067,53 +2014,6 @@ function PlayPageClient() {
                   {detail.desc}
                 </div>
               )}
-            </div>
-          </div>
-
-          {/* 封面展示 */}
-          <div className='hidden md:block md:col-span-1 md:order-first'>
-            <div className='pl-0 py-4 pr-6'>
-              <div className='relative bg-gray-300 dark:bg-gray-700 aspect-[2/3] flex items-center justify-center rounded-xl overflow-hidden'>
-                {videoCover ? (
-                  <>
-                    <img
-                      src={processImageUrl(videoCover)}
-                      alt={videoTitle}
-                      className='w-full h-full object-cover'
-                    />
-
-                    {/* 豆瓣链接按钮 */}
-                    {videoDoubanId !== 0 && (
-                      <a
-                        href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
-                        target='_blank'
-                        rel='noopener noreferrer'
-                        className='absolute top-3 left-3'
-                      >
-                        <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
-                          <svg
-                            width='16'
-                            height='16'
-                            viewBox='0 0 24 24'
-                            fill='none'
-                            stroke='currentColor'
-                            strokeWidth='2'
-                            strokeLinecap='round'
-                            strokeLinejoin='round'
-                          >
-                            <path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'></path>
-                            <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'></path>
-                          </svg>
-                        </div>
-                      </a>
-                    )}
-                  </>
-                ) : (
-                  <span className='text-gray-600 dark:text-gray-400'>
-                    封面图片
-                  </span>
-                )}
-              </div>
             </div>
           </div>
         </div>
