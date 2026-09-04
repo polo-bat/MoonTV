@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment, @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps, no-console, @next/next/no-img-element */
 
 'use client';
-import { Heart } from 'lucide-react';
+import { Download, Heart } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
 
@@ -14,13 +14,16 @@ import {
 } from '@/lib/danmaku.client';
 import {
   deleteFavorite,
+  deleteFollowing,
   deletePlayRecord,
   deleteSkipConfig,
   generateStorageKey,
   getAllPlayRecords,
   getSkipConfig,
   isFavorited,
+  isFollowing,
   saveFavorite,
+  saveFollowing,
   savePlayRecord,
   saveSkipConfig,
   subscribeToDataUpdates,
@@ -28,8 +31,10 @@ import {
 import { SearchResult } from '@/lib/types';
 import { getRequestTimeout, getVideoResolutionFromM3u8 } from '@/lib/utils';
 
+import AddDownloadModal from '@/components/AddDownloadModal';
 import DanmakuSelector from '@/components/DanmakuSelector';
 import EpisodeSelector from '@/components/EpisodeSelector';
+import { FollowingIconButton } from '@/components/FollowingIcon';
 import { triggerGlobalError } from '@/components/GlobalErrorIndicator';
 import PageLayout from '@/components/PageLayout';
 
@@ -68,6 +73,10 @@ function PlayPageClient() {
 
   // 收藏状态
   const [favorited, setFavorited] = useState(false);
+  const [following, setFollowing] = useState(false);
+
+  // 添加下载弹窗状态
+  const [showAddDownload, setShowAddDownload] = useState(false);
 
   // 跳过片头片尾配置
   const [skipConfig, setSkipConfig] = useState<{
@@ -92,6 +101,7 @@ function PlayPageClient() {
   // 跳过检查的时间间隔控制
   const lastSkipCheckRef = useRef(0);
 
+  const [isBlockAdChanged, setIsBlockAdChanged] = useState(false);
   // 去广告开关（从 localStorage 继承，默认 true）
   const [blockAdEnabled, setBlockAdEnabled] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -104,9 +114,6 @@ function PlayPageClient() {
   useEffect(() => {
     blockAdEnabledRef.current = blockAdEnabled;
   }, [blockAdEnabled]);
-
-  // 弹幕 XML 文件 URL
-  const [danmukuUrl, setDanmukuUrl] = useState<string>('');
 
   // 弹幕源选择相关
   const [selectedDanmakuSource, setSelectedDanmakuSource] = useState<
@@ -172,7 +179,7 @@ function PlayPageClient() {
   const currentEpisodeIndexRef = useRef(currentEpisodeIndex);
 
   useEffect(() => {
-    if (!selectedDanmakuAnime || !detail || !isDanmakuPluginReady) return;
+    if (!selectedDanmakuAnime || !detail) return;
   
     const currentEpisodeTitle = detail?.episodes_titles?.[currentEpisodeIndex];
     if (!currentEpisodeTitle) return;
@@ -191,8 +198,6 @@ function PlayPageClient() {
     }
   
     if (!matchedEpisode) return;
-
-    setCurrentTooltip(matchedEpisode.episodeTitle);
   
     const episodeIndex = selectedDanmakuAnime.episodes.indexOf(matchedEpisode);
     const episodeNumber = episodeIndex + 1;
@@ -215,26 +220,32 @@ function PlayPageClient() {
           episodeNumber,
           "xml"
         );
-        setDanmukuUrl(url);
+        if (danmukuPluginInstanceRef.current && url !== lastDanmakuUrlRef.current) {
+          console.log('动态更新弹幕源:', url);
+          danmukuPluginInstanceRef.current.config({ danmuku: url });
+          danmukuPluginInstanceRef.current.load();
+          lastDanmakuUrlRef.current = url;
+
+          if (pendingDanmakuVisibleRestoreRef.current !== null) {
+            const visible = pendingDanmakuVisibleRestoreRef.current;
+            if (danmakuVisibleRestoreTimerRef.current) {
+              clearTimeout(danmakuVisibleRestoreTimerRef.current);
+            }
+            danmakuVisibleRestoreTimerRef.current = setTimeout(() => {
+              danmakuConfigRef.current.visible = visible;
+              danmukuPluginInstanceRef.current?.config({ visible });
+              pendingDanmakuVisibleRestoreRef.current = null;
+              danmakuVisibleRestoreTimerRef.current = null;
+            }, DANMAKU_VISIBLE_RESTORE_DELAY_MS);
+          }
+
+          setCurrentTooltip(matchedEpisode.episodeTitle);
+        }
       } catch (e) {
         console.error("获取弹幕 URL 失败:", e);
-        setDanmukuUrl("");
       }
     })();
-  }, [currentEpisodeIndex, selectedDanmakuAnime, selectedDanmakuEpisode, isDanmakuPluginReady]);
-  
-
-  // 当弹幕 URL 变化时，动态更新插件弹幕源
-  useEffect(() => {
-    if (!danmukuPluginInstanceRef.current || !danmukuUrl) return;
-    try {
-      console.log('动态更新弹幕源:', danmukuUrl);
-      danmukuPluginInstanceRef.current.reset();
-      danmukuPluginInstanceRef.current.load(danmukuUrl);
-    } catch (error) {
-      console.error('更新弹幕源失败:', error);
-    }
-  }, [danmukuUrl]);
+  }, [currentEpisodeIndex, selectedDanmakuAnime, selectedDanmakuEpisode]);
 
 
   // 同步最新值到 refs
@@ -266,6 +277,43 @@ function PlayPageClient() {
   const lastVolumeRef = useRef<number>(0.7);
   // 上次使用的播放速率，默认 1.0
   const lastPlaybackRateRef = useRef<number>(1.0);
+  const lastFullscreenRef = useRef<boolean>(false);
+  const lastFullscreenWebRef = useRef<boolean>(false);
+  const danmakuConfigRef = useRef<any>({
+    danmuku: '',
+    speed: 5,
+    margin: [10, '25%'],
+    opacity: 1,
+    color: '#FFFFFF',
+    mode: 0,
+    modes: [0, 1, 2],
+    fontSize: 25,
+    antiOverlap: true,
+    synchronousPlayback: false,
+    mount: undefined,
+    heatmap: false,
+    width: 512,
+    points: [],
+    filter: (danmu: any) => danmu.text.length <= 100,
+    beforeVisible: () => true,
+    visible: true,
+    emitter: false,
+    maxLength: 200,
+    lockTime: 5,
+    theme: 'dark',
+    OPACITY: {},
+    FONT_SIZE: {},
+    MARGIN: {},
+    SPEED: {},
+    COLOR: [],
+    beforeEmit(_danmu: any) {
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(true);
+        }, 1000);
+      });
+    },
+  });
 
   // 换源相关状态
   const [availableSources, setAvailableSources] = useState<SearchResult[]>([]);
@@ -292,9 +340,47 @@ function PlayPageClient() {
   const artPlayerRef = useRef<any>(null);
   const artRef = useRef<HTMLDivElement | null>(null);
   const danmukuPluginInstanceRef = useRef<any>(null); // 弹幕插件实例
+  const lastDanmakuUrlRef = useRef<string>(''); // 上一次加载的弹幕 URL
+  const pendingDanmakuVisibleRestoreRef = useRef<boolean | null>(null); // 切集后待恢复的弹幕可见状态
+  const isEpisodeSwitchingRef = useRef(false); // 标记当前是否为切集切换
+  const danmakuVisibleRestoreTimerRef = useRef<NodeJS.Timeout | null>(null); // 延迟恢复弹幕可见性的定时器
 
   // Wake Lock 相关
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const DANMAKU_VISIBLE_RESTORE_DELAY_MS = 1500;
+
+  // 切换集数时临时隐藏弹幕，待弹幕获取成功后恢复
+  const hideDanmakuDuringEpisodeSwitch = () => {
+    if (danmakuVisibleRestoreTimerRef.current) {
+      clearTimeout(danmakuVisibleRestoreTimerRef.current);
+      danmakuVisibleRestoreTimerRef.current = null;
+    }
+
+    const inst = danmukuPluginInstanceRef.current as any;
+    const currentVisible =
+      typeof inst?.visible === 'boolean'
+        ? inst.visible
+        : !!danmakuConfigRef.current.visible;
+
+    pendingDanmakuVisibleRestoreRef.current = currentVisible;
+    danmakuConfigRef.current.visible = false;
+
+    if (!inst) return;
+
+    try {
+      inst.config({ visible: false });
+    } catch (_) {
+      // ignore
+    }
+
+    try {
+      if (typeof inst.visible === 'boolean') {
+        inst.visible = false;
+      }
+    } catch (_) {
+      // ignore
+    }
+  };
 
   // -----------------------------------------------------------------------------
   // 工具函数（Utils）
@@ -430,17 +516,6 @@ function PlayPageClient() {
 
     // 按综合评分排序，选择最佳播放源
     resultsWithScore.sort((a, b) => b.score - a.score);
-
-    console.log('播放源评分排序结果:');
-    resultsWithScore.forEach((result, index) => {
-      console.log(
-        `${index + 1}. ${
-          result.source.source_name
-        } - 评分: ${result.score.toFixed(2)} (${result.testResult.quality}, ${
-          result.testResult.loadSpeed
-        }, ${result.testResult.pingTime}ms)`
-      );
-    });
 
     // 构建评分映射
     const scoreMap = new Map<string, number>();
@@ -586,6 +661,12 @@ function PlayPageClient() {
   // Wake Lock 相关函数
   const requestWakeLock = async () => {
     try {
+      // 检查页面是否可见
+      if (document.hidden) {
+        console.log('页面不可见，跳过 Wake Lock 请求');
+        return;
+      }
+      
       if ('wakeLock' in navigator) {
         wakeLockRef.current = await (navigator as any).wakeLock.request(
           'screen'
@@ -613,6 +694,19 @@ function PlayPageClient() {
   const cleanupPlayer = () => {
     if (artPlayerRef.current) {
       try {
+        lastFullscreenRef.current = !!artPlayerRef.current.fullscreen;
+        lastFullscreenWebRef.current = !!artPlayerRef.current.fullscreenWeb;
+        if (danmukuPluginInstanceRef.current) {
+          const inst = danmukuPluginInstanceRef.current as any;
+          if (inst.option) {
+            const next = { ...inst.option };
+            if ('mount' in next) next.mount = undefined;
+            if ('danmuku' in next) next.danmuku = "";
+            danmakuConfigRef.current = next;
+          } else if (typeof inst.visible === 'boolean') {
+            danmakuConfigRef.current.visible = inst.visible;
+          }
+        }
         // 销毁 HLS 实例
         if (artPlayerRef.current.video && artPlayerRef.current.video.hls) {
           artPlayerRef.current.video.hls.destroy();
@@ -974,6 +1068,12 @@ function PlayPageClient() {
 
   // 视频初始化后即可匹配弹幕
   useEffect(() => {
+    if (isDanmakuPluginReady && isBlockAdChanged){
+      danmukuPluginInstanceRef.current.config({ danmuku: lastDanmakuUrlRef.current });
+      danmukuPluginInstanceRef.current.load();
+      setIsBlockAdChanged(false);
+      return;
+    }
     if (!autoDanmakuEnabled || !detail || !isDanmakuPluginReady) return;
 
     // 取消之前的请求
@@ -983,71 +1083,84 @@ function PlayPageClient() {
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
-    (async () => {
+    // 获取尝试次数设置
+    let retryCount = 3;
+    try {
+      const saved = localStorage.getItem('danmakuRetryCount');
+      if (saved !== null) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed)) retryCount = parsed;
+      }
+    } catch {
+      // ignore
+    }
+
+    let attempt = 0;
+    let success = false;
+
+    const fetchDanmaku = async () => {
       setIsDanmakuLoading(true);
-      try {
-        const title = videoTitleRef.current;
-
-        const currentEpisodeTitle = detail?.episodes_titles?.[currentEpisodeIndex];
-
-        if (!currentEpisodeTitle) {
-          throw new Error("无法获取当前集数标题（episodes_titles 无效）");
-        }
-    
-        // 从当前集数标题中提取集数
-        let epNum = extractEpisodeNumber(currentEpisodeTitle);
-        if (!epNum) {
-          epNum = currentEpisodeIndex + 1;
-        }
-
-        const platform = preferredDanmakuPlatform;
-
-        const season = extractSeasonFromTitle(title);
-        const fileName = `${title} S${season}E${epNum} @${platform}`;
-
-        const matches = await matchAnime(fileName, abortController.signal);
-        console.log("初始化自动匹配:", matches);
-
-        // 如果请求已被取消，则忽略结果
-        if (abortController.signal.aborted) return;
-
-        if (matches.length > 0) {
-          const m = matches[0];
-
-          const animeOption = {
-            animeId: m.animeId,
-            animeTitle: m.animeTitle,
-            type: m.type,
-            typeDescription: m.typeDescription,
-            episodeCount: 1,
-            episodes: [
-              {
-                episodeId: m.episodeId,
-                episodeTitle: m.episodeTitle,
-              },
-            ],
-          };
-
-          setSelectedDanmakuAnime(animeOption);
-          setSelectedDanmakuSource(platform);
-
-        } else {
-          triggerGlobalError("自动加载弹幕失败，请手动选择弹幕源");
-        }
-      } catch (err) {
-        // 如果是取消错误，不显示错误
-        if (err instanceof DOMException && err.name === 'AbortError') {
-          console.log('自动加载弹幕已取消');
-          return;
-        }
-        console.error("初始化自动加载弹幕失败:", err);
-        triggerGlobalError("自动加载弹幕失败，请手动选择弹幕源");
-      } finally {
-        if (!abortController.signal.aborted) {
-          setIsDanmakuLoading(false);
+      while (!success && (retryCount === -1 || attempt <= retryCount)) {
+        attempt++;
+        try {
+          const title = videoTitleRef.current;
+          const currentEpisodeTitle = detail?.episodes_titles?.[currentEpisodeIndex];
+          if (!currentEpisodeTitle) {
+            throw new Error("无法获取当前集数标题（episodes_titles 无效）");
+          }
+          let epNum = extractEpisodeNumber(currentEpisodeTitle);
+          if (!epNum) {
+            epNum = currentEpisodeIndex + 1;
+          }
+          const platform = preferredDanmakuPlatform;
+          const season = extractSeasonFromTitle(title);
+          const fileName = `${title} S${season}E${epNum} @${platform}`;
+          const matches = await matchAnime(fileName, abortController.signal);
+          console.log(`自动弹幕匹配尝试第${attempt}次:`, matches);
+          if (abortController.signal.aborted) return;
+          if (matches.length > 0) {
+            const m = matches[0];
+            const animeOption = {
+              animeId: m.animeId,
+              animeTitle: m.animeTitle,
+              type: m.type,
+              typeDescription: m.typeDescription,
+              episodeCount: 1,
+              episodes: [
+                {
+                  episodeId: m.episodeId,
+                  episodeTitle: m.episodeTitle,
+                },
+              ],
+            };
+            setSelectedDanmakuAnime(animeOption);
+            setSelectedDanmakuSource(platform);
+            success = true;
+            break;
+          } else {
+            if (retryCount === -1 || attempt <= retryCount) {
+              await new Promise(res => setTimeout(res, 1500)); // 间隔1.5秒重试
+            }
+          }
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            console.log('自动加载弹幕已取消');
+            return;
+          }
+          console.error(`自动弹幕匹配第${attempt}次失败:`, err);
+          if (retryCount === -1 || attempt <= retryCount) {
+            await new Promise(res => setTimeout(res, 1500));
+          }
         }
       }
-    })();
+      if (!success) {
+        triggerGlobalError("自动加载弹幕失败，请手动选择弹幕源");
+      }
+      if (!abortController.signal.aborted) {
+        setIsDanmakuLoading(false);
+      }
+    };
+    fetchDanmaku();
 
     // 清理函数：当依赖项变化或组件卸载时中止请求
     return () => {
@@ -1215,11 +1328,30 @@ function PlayPageClient() {
   // 集数切换
   // ---------------------------------------------------------------------------
   // 处理集数切换
-  const handleEpisodeChange = (episodeNumber: number) => {
+  const handleEpisodeChange = async (episodeNumber: number) => {
+    if (episodeNumber === currentEpisodeIndexRef.current) return;
     if (episodeNumber >= 0 && episodeNumber < totalEpisodes) {
+      isEpisodeSwitchingRef.current = true;
+      hideDanmakuDuringEpisodeSwitch();
       // 在更换集数前保存当前播放进度
       if (artPlayerRef.current && artPlayerRef.current.paused) {
         saveCurrentPlayProgress();
+      }
+      if (artPlayerRef.current) {
+        setCurrentTooltip("");
+      }
+      // 检查是否有历史播放记录
+      try {
+        const allRecords = await getAllPlayRecords();
+        const key = generateStorageKey(currentSourceRef.current, currentIdRef.current);
+        const record = allRecords[key];
+        if (record && record.index - 1 === episodeNumber && record.play_time > 0) {
+          resumeTimeRef.current = record.play_time;
+        } else {
+          resumeTimeRef.current = 0;
+        }
+      } catch {
+        resumeTimeRef.current = 0;
       }
       setCurrentEpisodeIndex(episodeNumber);
     }
@@ -1229,8 +1361,13 @@ function PlayPageClient() {
     const d = detailRef.current;
     const idx = currentEpisodeIndexRef.current;
     if (d && d.episodes && idx > 0) {
+      isEpisodeSwitchingRef.current = true;
+      hideDanmakuDuringEpisodeSwitch();
       if (artPlayerRef.current && !artPlayerRef.current.paused) {
         saveCurrentPlayProgress();
+      }
+      if(artPlayerRef.current){
+        setCurrentTooltip("");
       }
       setCurrentEpisodeIndex(idx - 1);
     }
@@ -1240,8 +1377,13 @@ function PlayPageClient() {
     const d = detailRef.current;
     const idx = currentEpisodeIndexRef.current;
     if (d && d.episodes && idx < d.episodes.length - 1) {
+      isEpisodeSwitchingRef.current = true;
+      hideDanmakuDuringEpisodeSwitch();
       if (artPlayerRef.current && !artPlayerRef.current.paused) {
         saveCurrentPlayProgress();
+      }
+      if(artPlayerRef.current){
+        setCurrentTooltip("");
       }
       setCurrentEpisodeIndex(idx + 1);
     }
@@ -1493,6 +1635,60 @@ function PlayPageClient() {
     }
   };
 
+  useEffect(() => {
+    if (!currentSource || !currentId) return;
+
+    const refreshFollowingState = async () => {
+      const isFollow = await isFollowing(currentSource, currentId);
+      setFollowing(isFollow);
+    };
+
+    refreshFollowingState();
+
+    const unsubscribe = subscribeToDataUpdates(
+      'followingsUpdated',
+      (followings: Record<string, any>) => {
+        const key = generateStorageKey(currentSource, currentId);
+        setFollowing(!!followings[key]);
+      }
+    );
+
+    return unsubscribe;
+  }, [currentSource, currentId]);
+
+  const handleToggleFollowing = async () => {
+    if (
+      !videoTitleRef.current ||
+      !detailRef.current ||
+      !currentSourceRef.current ||
+      !currentIdRef.current
+    )
+      return;
+
+    try {
+      if (following) {
+        await deleteFollowing(currentSourceRef.current, currentIdRef.current);
+        setFollowing(false);
+      } else {
+        await saveFollowing(currentSourceRef.current, currentIdRef.current, {
+          title: videoTitleRef.current,
+          source_name: detailRef.current?.source_name || '',
+          year: detailRef.current?.year,
+          cover: detailRef.current?.poster || '',
+          total_episodes: detailRef.current?.episodes.length || 1,
+          watched_episodes: currentEpisodeIndexRef.current + 1,
+          save_time: Date.now(),
+          search_title: searchTitle,
+          source: currentSourceRef.current,
+          id: currentIdRef.current,
+        });
+        setFollowing(true);
+      }
+    } catch (err) {
+      console.error('切换追更失败:', err);
+    }
+  };
+
   // 动态加载播放器相关库，仅在客户端
   const artLibRef = useRef<any>(null);
   const hlsLibRef = useRef<any>(null);
@@ -1563,6 +1759,23 @@ function PlayPageClient() {
     const isWebkit =
       typeof window !== 'undefined' &&
       typeof (window as any).webkitConvertPointFromNodeToPage === 'function';
+
+    // 切集时无论浏览器类型都优先复用实例，避免销毁播放器
+    if (artPlayerRef.current && isEpisodeSwitchingRef.current) {
+      artPlayerRef.current.switch = videoUrl;
+      artPlayerRef.current.title = `${videoTitle} - 第${
+        currentEpisodeIndex + 1
+      }集`;
+      artPlayerRef.current.poster = videoCover;
+      if (artPlayerRef.current?.video) {
+        ensureVideoSource(
+          artPlayerRef.current.video as HTMLVideoElement,
+          videoUrl
+        );
+      }
+      isEpisodeSwitchingRef.current = false;
+      return;
+    }
 
     // 非WebKit浏览器且播放器已存在，使用switch方法切换
     if (!isWebkit && artPlayerRef.current) {
@@ -1652,42 +1865,7 @@ function PlayPageClient() {
           crossOrigin: 'anonymous',
         },
         plugins: [
-          danmukuPluginRef.current({
-            danmuku: danmukuUrl || '', // 使用 XML 文件
-            speed: 5,
-            margin: [10, '25%'],
-            opacity: 1,
-            color: '#FFFFFF',
-            mode: 0,
-            modes: [0, 1, 2],
-            fontSize: 25,
-            antiOverlap: true,
-            synchronousPlayback: false,
-            mount: undefined,
-            heatmap: false,
-            width: 512,
-            points: [],
-            filter: (danmu: any) => danmu.text.length <= 100,
-            beforeVisible: () => true,
-            visible: true, // 始终显示，因为开关控制已移除
-            emitter: false,
-            maxLength: 200,
-            lockTime: 5,
-            theme: 'dark',
-            OPACITY: {},
-            FONT_SIZE: {},
-            MARGIN: {},
-            SPEED: {},
-            COLOR: [],
-            beforeEmit(danmu: any) {
-              return new Promise((resolve) => {
-                console.log('发送弹幕:', danmu);
-                setTimeout(() => {
-                  resolve(true);
-                }, 1000);
-              });
-            },
-          }),
+          danmukuPluginRef.current(danmakuConfigRef.current),
         ],
         // HLS 支持配置
         customType: {
@@ -1768,6 +1946,8 @@ function PlayPageClient() {
                   artPlayerRef.current = null;
                 }
                 setBlockAdEnabled(newVal);
+                setIsDanmakuPluginReady(false);
+                setIsBlockAdChanged(true);
               } catch (_) {
                 // ignore
               }
@@ -1875,11 +2055,30 @@ function PlayPageClient() {
             artPlayerRef.current.plugins.artplayerPluginDanmuku;
           console.log('弹幕插件实例已捕获', danmukuPluginInstanceRef.current);
           setIsDanmakuPluginReady(true);
+          if (danmukuPluginInstanceRef.current) {
+            try {
+              danmukuPluginInstanceRef.current.config(danmakuConfigRef.current);
+            } catch (_) {
+              // ignore
+            }
+          }
         }
 
         // 播放器就绪后，如果正在播放则请求 Wake Lock
         if (artPlayerRef.current && !artPlayerRef.current.paused) {
           requestWakeLock();
+        }
+        try {
+          if (lastFullscreenWebRef.current) {
+            artPlayerRef.current.fullscreenWeb = true;
+          }
+          if (lastFullscreenRef.current) {
+            setTimeout(() => {
+              artPlayerRef.current.fullscreen = true;
+            }, 0);
+          }
+        } catch (_) {
+          // ignore
         }
       });
 
@@ -2005,7 +2204,7 @@ function PlayPageClient() {
         const idx = currentEpisodeIndexRef.current;
         if (d && d.episodes && idx < d.episodes.length - 1) {
           setTimeout(() => {
-            setCurrentEpisodeIndex(idx + 1);
+            handleNextEpisode();
           }, 1000);
         }
       });
@@ -2047,7 +2246,25 @@ function PlayPageClient() {
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
+    // 监听页面可见性变化
+    const handleVisibilityChange = () => {
+      if (!document.hidden && artPlayerRef.current && !artPlayerRef.current.paused) {
+        // 页面变为可见且视频正在播放时，重新请求 Wake Lock
+        requestWakeLock();
+      } else if (document.hidden) {
+        // 页面隐藏时，释放 Wake Lock（系统会自动释放，但我们也主动释放）
+        releaseWakeLock();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
+      if (danmakuVisibleRestoreTimerRef.current) {
+        clearTimeout(danmakuVisibleRestoreTimerRef.current);
+        danmakuVisibleRestoreTimerRef.current = null;
+      }
+
       // 清理定时器
       if (saveIntervalRef.current) {
         clearInterval(saveIntervalRef.current);
@@ -2055,6 +2272,9 @@ function PlayPageClient() {
 
       // 释放 Wake Lock
       releaseWakeLock();
+
+      // 移除可见性监听
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
 
       // 销毁播放器实例
       cleanupPlayer();
@@ -2357,24 +2577,49 @@ function PlayPageClient() {
                       `第 ${currentEpisodeIndex + 1} 集`}
                   </span>
                 )}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleToggleFavorite();
-                  }}
-                  className='ml-3 flex-shrink-0 hover:opacity-80 transition-opacity'
-                >
-                  <FavoriteIcon filled={favorited} />
-                </button>
-                {/* 豆瓣链接按钮 */}
-                {videoDoubanId !== 0 && (
-                  <a
-                    href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
-                    target='_blank'
-                    rel='noopener noreferrer'
-                    className='ml-3 flex-shrink-0'
+                <div className='ml-3 flex flex-shrink-0 items-center gap-3'>
+                  <button
+                    type='button'
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleToggleFavorite();
+                    }}
+                    className={`flex h-8 w-8 items-center justify-center rounded-full shadow-md transition-all duration-300 ease-out hover:scale-[1.1] ${
+                      favorited
+                        ? 'bg-red-500 text-white hover:bg-red-600'
+                        : 'bg-gray-200 text-gray-600 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600'
+                    }`}
+                    title={favorited ? '取消收藏' : '加入收藏'}
+                    aria-label={favorited ? '取消收藏' : '加入收藏'}
                   >
-                    <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
+                    <Heart
+                      className={`h-4 w-4 ${
+                        favorited
+                          ? 'fill-white stroke-white'
+                          : 'fill-transparent stroke-current stroke-[1.5]'
+                      }`}
+                    />
+                  </button>
+                  {videoUrl && (
+                    <button
+                      type='button'
+                      onClick={() => setShowAddDownload(true)}
+                      className='flex h-8 w-8 items-center justify-center rounded-full bg-blue-500 text-white shadow-md transition-all duration-300 ease-out hover:scale-[1.1] hover:bg-blue-600'
+                      title='下载视频'
+                      aria-label='下载视频'
+                    >
+                      <Download className='h-4 w-4' />
+                    </button>
+                  )}
+                  {videoDoubanId !== 0 && (
+                    <a
+                      href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
+                      target='_blank'
+                      rel='noopener noreferrer'
+                      className='flex h-8 w-8 items-center justify-center rounded-full bg-green-500 text-white shadow-md transition-all duration-300 ease-out hover:scale-[1.1] hover:bg-green-600'
+                      title='打开豆瓣页面'
+                      aria-label='打开豆瓣页面'
+                    >
                       <svg
                         width='16'
                         height='16'
@@ -2384,13 +2629,26 @@ function PlayPageClient() {
                         strokeWidth='2'
                         strokeLinecap='round'
                         strokeLinejoin='round'
+                        aria-hidden='true'
                       >
                         <path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'></path>
                         <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'></path>
                       </svg>
-                    </div>
-                  </a>
-                )}
+                    </a>
+                  )}
+                  {currentSource && currentId && (
+                    <FollowingIconButton
+                      following={following}
+                      size={16}
+                      padding={8}
+                      theme='detail'
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleFollowing();
+                      }}
+                    />
+                  )}
+                </div>
               </h1>
 
               {/* 关键信息行 */}
@@ -2423,34 +2681,29 @@ function PlayPageClient() {
           </div>
         </div>
       </div>
+
+      {/* 添加下载弹窗 */}
+      <AddDownloadModal
+        isOpen={showAddDownload}
+        onClose={() => setShowAddDownload(false)}
+        onAddTask={(config) => {
+          // 触发自定义事件，通知导航栏的下载管理器
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('addDownloadTask', { detail: config }));
+          }
+          setShowAddDownload(false);
+        }}
+        initialUrl={videoUrl || ''}
+        initialTitle={`${videoTitle}${
+          totalEpisodes > 1
+            ? `_${detail?.episodes_titles?.[currentEpisodeIndex] || `第${currentEpisodeIndex + 1}集`}`
+            : ''
+        }`}
+        skipConfig={skipConfig}
+      />
     </PageLayout>
   );
 }
-
-// FavoriteIcon 组件
-const FavoriteIcon = ({ filled }: { filled: boolean }) => {
-  if (filled) {
-    return (
-      <svg
-        className='h-7 w-7'
-        viewBox='0 0 24 24'
-        xmlns='http://www.w3.org/2000/svg'
-      >
-        <path
-          d='M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z'
-          fill='#ef4444' /* Tailwind red-500 */
-          stroke='#ef4444'
-          strokeWidth='2'
-          strokeLinecap='round'
-          strokeLinejoin='round'
-        />
-      </svg>
-    );
-  }
-  return (
-    <Heart className='h-7 w-7 stroke-[1] text-gray-600 dark:text-gray-300' />
-  );
-};
 
 export default function PlayPage() {
   return (

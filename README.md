@@ -25,6 +25,7 @@
 - 🔍 **多源聚合搜索**：快速返回结果。
 - 📄 **丰富详情页**：支持剧集列表、演员、年份、简介等完整信息展示。
 - ▶️ **流畅在线播放**：集成 HLS.js & ArtPlayer。
+- 📥 **视频下载**：支持 M3U8 视频下载，多线程并发加速，边下边存功能（Chrome/Edge）。
 - ❤️ **收藏 + 继续观看**：支持 Redis/Upstash 存储，多端同步进度。
 - 📱 **PWA**：离线缓存、安装到桌面/主屏，移动端原生体验。
 - 🌗 **响应式布局**：桌面侧边栏 + 移动底部导航，自适应各种屏幕尺寸。
@@ -50,7 +51,7 @@
     - [Vercel 部署](#vercel-部署)
       - [普通部署（localstorage）](#普通部署localstorage)
       - [Upstash Redis 支持](#upstash-redis-支持)
-    - [Netlify 部署(推荐)](#netlify-部署推荐)
+    - [Netlify 部署](#netlify-部署)
       - [普通部署（localstorage）](#普通部署localstorage-1)
       - [Upstash Redis 支持](#upstash-redis-支持-1)
     - [Cloudflare 部署](#cloudflare-部署)
@@ -60,6 +61,8 @@
       - [直接运行（最简单，localstorage）](#直接运行最简单localstorage)
       - [Docker Compose](#docker-compose)
         - [local storage 存储](#local-storage-存储)
+        - [Kvrocks 存储（推荐）](#kvrocks-存储推荐)
+        - [Redis 存储（有一定的丢数据风险）](#redis-存储有一定的丢数据风险)
         - [Upstash 存储](#upstash-存储)
   - [环境变量](#环境变量)
   - [配置说明](#配置说明)
@@ -126,7 +129,7 @@
 4. 设置环境变量 NEXT_PUBLIC_STORAGE_TYPE，值为 **upstash**；设置 USERNAME 和 PASSWORD 作为站长账号
 5. 重试部署
 
-### Netlify 部署(推荐)
+### Netlify 部署
 
 #### 普通部署（localstorage）
 
@@ -199,6 +202,73 @@ services:
       - '3000:3000'
     environment:
       - PASSWORD=password
+```
+
+##### Kvrocks 存储（推荐）
+
+```yml
+services:
+  moontv-core:
+    image: ghcr.io/stardm0/moontv:latest
+    container_name: moontv-core
+    restart: on-failure
+    ports:
+      - '3000:3000'
+    environment:
+      - USERNAME=admin
+      - PASSWORD=admin_password
+      - NEXT_PUBLIC_STORAGE_TYPE=kvrocks
+      - KVROCKS_URL=redis://moontv-kvrocks:6666
+    networks:
+      - moontv-network
+    depends_on:
+      - moontv-kvrocks
+  moontv-kvrocks:
+    image: apache/kvrocks
+    container_name: moontv-kvrocks
+    restart: unless-stopped
+    volumes:
+      - kvrocks-data:/var/lib/kvrocks
+    networks:
+      - moontv-network
+networks:
+  moontv-network:
+    driver: bridge
+volumes:
+  kvrocks-data:
+```
+
+##### Redis 存储（有一定的丢数据风险）
+
+```yml
+services:
+  moontv-core:
+    image: ghcr.io/stardm0/moontv:latest
+    container_name: moontv-core
+    restart: on-failure
+    ports:
+      - '3000:3000'
+    environment:
+      - USERNAME=admin
+      - PASSWORD=admin_password
+      - NEXT_PUBLIC_STORAGE_TYPE=redis
+      - REDIS_URL=redis://moontv-redis:6379
+    networks:
+      - moontv-network
+    depends_on:
+      - moontv-redis
+  moontv-redis:
+    image: redis:alpine
+    container_name: moontv-redis
+    restart: unless-stopped
+    networks:
+      - moontv-network
+    # 请开启持久化，否则升级/重启后数据丢失
+    volumes:
+      - ./data:/data
+networks:
+  moontv-network:
+    driver: bridge
 ```
 
 ##### Upstash 存储
