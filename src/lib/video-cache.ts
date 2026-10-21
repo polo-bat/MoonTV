@@ -71,7 +71,7 @@ export interface CacheSettings {
   maxBytesPerEpisode: number;
   /** 全部缓存最大占用（字节） */
   maxTotalBytes: number;
-  /** 是否走 /api/m3u8 同源代理（false 时直接缓存源站绝对 URL） */
+  /** 直连失败时是否允许同源代理兜底；同时决定缓存键格式以兼容旧缓存 */
   useProxy: boolean;
 }
 
@@ -215,7 +215,17 @@ function openMetaDb(): Promise<IDBDatabase> {
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
     request.onerror = () => reject(request.error);
   });
 
@@ -236,7 +246,13 @@ function runTx<T>(
       new Promise<T>((resolve, reject) => {
         const transaction = db.transaction(META_STORE, mode);
         const request = fn(transaction.objectStore(META_STORE));
-        request.onsuccess = () => resolve(request.result as T);
+        // Request success precedes commit; a transaction may still abort.
+        transaction.oncomplete = () => resolve(request.result as T);
+        transaction.onabort = () =>
+          reject(
+            transaction.error || new Error('Metadata transaction aborted')
+          );
+        transaction.onerror = () => reject(transaction.error);
         request.onerror = () => reject(request.error);
       })
   );
@@ -275,6 +291,9 @@ export async function touchMeta(key: string): Promise<void> {
     return previous !== undefined && now - previous < TOUCH_INTERVAL_MS;
   });
   if (throttled) return;
+  for (const [entry, touchedAt] of Array.from(lastTouchAt)) {
+    if (now - touchedAt >= TOUCH_INTERVAL_MS) lastTouchAt.delete(entry);
+  }
   variants.forEach((v) => lastTouchAt.set(v, now));
 
   try {
@@ -725,9 +744,9 @@ export function normalizeSegmentUrl(url: string): string {
 /**
  * 生成片段缓存键。
  *
- * - `useProxy = true`：转成同源的 `/api/m3u8?url=...`，键稳定，且天然规避源站
- *   的 Referer / CORS 校验；
- * - `useProxy = false`：直接用源站绝对 URL 作为键，省掉服务端带宽。
+ * - `useProxy = true`：使用同源的 `/api/m3u8?url=...` 格式；
+ * - `useProxy = false`：使用源站绝对 URL 格式。
+ * 缓存键格式独立于下载路由：预取始终优先直连，按设置允许代理兜底。
  */
 export function buildSegmentCacheKey(
   segmentUrl: string,
@@ -760,7 +779,7 @@ export async function putCachedSegment(
   contentType?: string | null
 ): Promise<void> {
   const cache = await openVideoCache();
-  if (!cache) return;
+  if (!cache) throw new Error('Video cache storage unavailable');
 
   await cache.put(
     key,
