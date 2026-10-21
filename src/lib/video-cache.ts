@@ -32,6 +32,9 @@ export interface SegmentMeta {
   source?: string;
   /** 片段序号（1 基，便于排查） */
   index: number;
+  /** 片段在视频中的实际起止时间（秒），旧缓存可能没有 */
+  startTime?: number;
+  endTime?: number;
   /** 字节数 */
   bytes: number;
   /** 预取时的实际耗时(ms)，用于给 hls.js 合成 LoaderStats，避免 ABR 高估带宽 */
@@ -85,7 +88,11 @@ export const DEFAULT_CACHE_SETTINGS: CacheSettings = {
   useProxy: true,
 };
 
-function clampNumber(value: unknown, min: number, max: number): number | undefined {
+function clampNumber(
+  value: unknown,
+  min: number,
+  max: number
+): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   return Math.min(max, Math.max(min, value));
 }
@@ -146,13 +153,24 @@ export function normalizeCacheSettings(input: unknown): CacheSettings {
   if (horizon !== undefined) {
     // 0 是「无限」哨兵，必须原样保留；其余值低于 1 分钟没有意义，抬到 60s
     settings.horizonSeconds =
-      horizon === 0 ? UNLIMITED_HORIZON_SECONDS : Math.max(60, Math.round(horizon));
+      horizon === 0
+        ? UNLIMITED_HORIZON_SECONDS
+        : Math.max(60, Math.round(horizon));
   }
 
-  const perEpisode = clampNumber(raw.maxBytesPerEpisode, 50 * 1024 * 1024, 8 * 1024 ** 3);
-  if (perEpisode !== undefined) settings.maxBytesPerEpisode = Math.round(perEpisode);
+  const perEpisode = clampNumber(
+    raw.maxBytesPerEpisode,
+    50 * 1024 * 1024,
+    8 * 1024 ** 3
+  );
+  if (perEpisode !== undefined)
+    settings.maxBytesPerEpisode = Math.round(perEpisode);
 
-  const total = clampNumber(raw.maxTotalBytes, 100 * 1024 * 1024, 20 * 1024 ** 3);
+  const total = clampNumber(
+    raw.maxTotalBytes,
+    100 * 1024 * 1024,
+    20 * 1024 ** 3
+  );
   if (total !== undefined) settings.maxTotalBytes = Math.round(total);
 
   if (settings.maxBytesPerEpisode > settings.maxTotalBytes) {
@@ -229,7 +247,9 @@ export const metaStore = {
     return runTx<void>('readwrite', (store) => store.put(record));
   },
   get(key: string): Promise<SegmentMeta | undefined> {
-    return runTx<SegmentMeta | undefined>('readonly', (store) => store.get(key));
+    return runTx<SegmentMeta | undefined>('readonly', (store) =>
+      store.get(key)
+    );
   },
   del(key: string): Promise<void> {
     return runTx<void>('readwrite', (store) => store.delete(key));
@@ -293,13 +313,17 @@ export async function openVideoCache(): Promise<Cache | null> {
  * 解决 cache.put 写入时某些浏览器自动把相对路径补成带 origin 的绝对 URL，
  * 导致读取侧用相对路径查不到的问题。
  */
-function getCacheKeyVariants(key: string): string[] {
+export function getCacheKeyVariants(key: string): string[] {
   const variants: string[] = [key];
   try {
     if (typeof location !== 'undefined') {
       const origin = location.origin;
       // 传入 key 是相对路径（以 / 开头，不是 //，不是 http...）
-      if (key.startsWith('/') && !key.startsWith('//') && !/^https?:/i.test(key)) {
+      if (
+        key.startsWith('/') &&
+        !key.startsWith('//') &&
+        !/^https?:/i.test(key)
+      ) {
         const abs = `${origin}${key}`;
         if (abs !== key) variants.push(abs);
       } else {
@@ -332,7 +356,8 @@ export async function hasCachedSegment(key: string): Promise<boolean> {
 
 /** 申请持久化存储，降低磁盘紧张时被浏览器整块清理的概率 */
 export async function ensurePersistentStorage(): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.storage?.persist) return false;
+  if (typeof navigator === 'undefined' || !navigator.storage?.persist)
+    return false;
   try {
     if (await navigator.storage.persisted()) return true;
     return await navigator.storage.persist();
@@ -348,7 +373,8 @@ export interface CacheStorageEstimate {
 }
 
 export async function estimateStorage(): Promise<CacheStorageEstimate | null> {
-  if (typeof navigator === 'undefined' || !navigator.storage?.estimate) return null;
+  if (typeof navigator === 'undefined' || !navigator.storage?.estimate)
+    return null;
   try {
     const { usage = 0, quota = 0 } = await navigator.storage.estimate();
     return { usage, quota, ratio: quota > 0 ? usage / quota : 0 };
@@ -548,21 +574,82 @@ export interface EpisodeCacheStat {
   lastAccess: number;
 }
 
+export interface CachedTimeRange {
+  startTime: number;
+  endTime: number;
+  firstIndex: number;
+  lastIndex: number;
+}
+
+/** 合并相邻或重叠的实际时间段，不把未缓存的间隙计入覆盖时长。 */
+export function mergeCachedTimeRanges(
+  records: Pick<SegmentMeta, 'index' | 'startTime' | 'endTime'>[]
+): CachedTimeRange[] {
+  const sorted = records
+    .filter(
+      (
+        record
+      ): record is { index: number; startTime: number; endTime: number } =>
+        typeof record.startTime === 'number' &&
+        typeof record.endTime === 'number' &&
+        Number.isFinite(record.startTime) &&
+        Number.isFinite(record.endTime) &&
+        record.startTime >= 0 &&
+        record.endTime > record.startTime
+    )
+    .sort((a, b) => a.startTime - b.startTime);
+  const ranges: CachedTimeRange[] = [];
+  for (const record of sorted) {
+    const previous = ranges[ranges.length - 1];
+    if (previous && record.startTime <= previous.endTime + 0.001) {
+      previous.endTime = Math.max(previous.endTime, record.endTime);
+      previous.firstIndex = Math.min(previous.firstIndex, record.index);
+      previous.lastIndex = Math.max(previous.lastIndex, record.index);
+    } else {
+      ranges.push({
+        startTime: record.startTime,
+        endTime: record.endTime,
+        firstIndex: record.index,
+        lastIndex: record.index,
+      });
+    }
+  }
+  return ranges;
+}
+
+/** 只返回仍存在于 Cache Storage 的元数据，排除已淘汰或被清空的片段。 */
+export async function getCachedSegmentRecords(): Promise<SegmentMeta[]> {
+  const cache = await openVideoCache();
+  if (!cache) return [];
+  const [records, requests] = await Promise.all([
+    metaStore.all(),
+    cache.keys(),
+  ]);
+  const keys = new Set(requests.map((request) => request.url));
+  return records.filter((record) =>
+    getCacheKeyVariants(record.key).some((key) => keys.has(key))
+  );
+}
+
 /** 按剧集聚合已缓存内容的统计（缓存管理面板用），按最近访问倒序 */
 export async function getEpisodeCacheStats(): Promise<EpisodeCacheStat[]> {
   try {
-    const records = await metaStore.all();
+    const records = await getCachedSegmentRecords();
     const grouped = new Map<string, EpisodeCacheStat>();
     for (const record of records) {
       const stat = grouped.get(record.episodeKey);
       if (stat) {
         stat.segments += 1;
         stat.bytes += record.bytes || 0;
-        if (record.lastAccess > stat.lastAccess) stat.lastAccess = record.lastAccess;
+        if (record.lastAccess > stat.lastAccess)
+          stat.lastAccess = record.lastAccess;
         if (!stat.title && record.title) stat.title = record.title;
         if (!stat.source && record.source) stat.source = record.source;
       } else {
-        const source = record.source || record.episodeKey.split(':').slice(0, -2).join(':') || '未知来源';
+        const source =
+          record.source ||
+          record.episodeKey.split(':').slice(0, -2).join(':') ||
+          '未知来源';
         const title = record.title || '未知影片';
         grouped.set(record.episodeKey, {
           episodeKey: record.episodeKey,
@@ -574,7 +661,9 @@ export async function getEpisodeCacheStats(): Promise<EpisodeCacheStat[]> {
         });
       }
     }
-    return Array.from(grouped.values()).sort((a, b) => b.lastAccess - a.lastAccess);
+    return Array.from(grouped.values()).sort(
+      (a, b) => b.lastAccess - a.lastAccess
+    );
   } catch {
     return [];
   }
@@ -614,7 +703,6 @@ export async function deleteEpisodeCache(episodeKey: string): Promise<number> {
   return removed;
 }
 
-
 /* ------------------------------------------------------------------ */
 /* 缓存键                                                              */
 /* ------------------------------------------------------------------ */
@@ -647,7 +735,9 @@ export function buildSegmentCacheKey(
   range?: SegmentByteRange
 ): string {
   const normalized = normalizeSegmentUrl(segmentUrl);
-  const key = useProxy ? `/api/m3u8?url=${encodeURIComponent(normalized)}` : normalized;
+  const key = useProxy
+    ? `/api/m3u8?url=${encodeURIComponent(normalized)}`
+    : normalized;
   if (!range) return key;
   // A synthetic query belongs only to Cache Storage, never to the CDN request.
   const url = new URL(key, 'https://cache.invalid');
@@ -687,7 +777,8 @@ export async function putCachedSegment(
 /** 判断是否为 Cache Storage 配额耗尽（各浏览器报错类型不一，按 name + message 双判） */
 export function isQuotaExceededError(err: unknown): boolean {
   if (!err) return false;
-  if (err instanceof DOMException && err.name === 'QuotaExceededError') return true;
+  if (err instanceof DOMException && err.name === 'QuotaExceededError')
+    return true;
   const name = (err as { name?: unknown }).name;
   if (name === 'QuotaExceededError') return true;
   const message = err instanceof Error ? err.message : String(err);
@@ -763,7 +854,9 @@ export async function readCachedSegment(
     const [data, recordPrimary, recordMatched] = await Promise.all([
       hit.arrayBuffer(),
       metaStore.get(key).catch(() => undefined),
-      matchedKey !== key ? metaStore.get(matchedKey).catch(() => undefined) : undefined,
+      matchedKey !== key
+        ? metaStore.get(matchedKey).catch(() => undefined)
+        : undefined,
     ]);
     const record = recordPrimary ?? recordMatched;
     return {
