@@ -11,6 +11,8 @@ import {
   MAX_NAME_LENGTH,
   MEMBER_PREVIEW_LIMIT,
   MEMBER_TIMEOUT_MS,
+  normalizeCapacity,
+  resolveCreateCapacity,
   ROOM_TTL_SECONDS,
   RoomEvent,
   RoomMember,
@@ -22,7 +24,7 @@ import {
 
 const ID_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
-/** 公开列表的全表扫描结果缓存 4 秒，避免大厅页面反复 SCAN / 全表 SELECT */
+/** 房间列表的全表扫描结果缓存 4 秒，避免大厅页面反复 SCAN / 全表 SELECT */
 const ROOMS_CACHE_MS = 4_000;
 let roomsCache: { at: number; rooms: WatchRoom[] } | null = null;
 
@@ -38,9 +40,72 @@ async function cachedListRooms(store: RoomStore): Promise<WatchRoom[]> {
   const now = Date.now();
   if (roomsCache && now - roomsCache.at < ROOMS_CACHE_MS)
     return roomsCache.rooms;
+  return freshListRooms(store, now);
+}
+
+/** 刷新列表：绕开 4 秒缓存直接读存储，并顺手把缓存更新为最新快照 */
+async function freshListRooms(
+  store: RoomStore,
+  now: number
+): Promise<WatchRoom[]> {
   const rooms = await store.listRooms();
   roomsCache = { at: now, rooms };
   return rooms;
+}
+
+/**
+ * 按 presence 层实时统计每个房间「已进入且保持心跳连接」的人数。
+ *
+ * 房间核心里的 memberCount 是房主心跳异步回写的快照，加上列表缓存后，
+ * 观众离开 / 加入时大厅页面可能长期显示旧值。这里改用成员在线标记
+ * （超过 MEMBER_TIMEOUT_MS 未 sync 即视为断开）逐个房间精确计数。
+ * limit=0 只取人数、不拉成员明细，避免刷新列表放大存储读取。
+ */
+async function liveCountsFor(
+  store: RoomStore,
+  rooms: WatchRoom[]
+): Promise<number[]> {
+  if (!rooms.length) return [];
+  return Promise.all(
+    rooms.map(async (room) => {
+      const presence = await store.getPresence(room.id, MEMBER_TIMEOUT_MS, 0);
+      return Math.max(0, Number(presence.count) || 0);
+    })
+  );
+}
+
+/**
+ * 校验房间是否还能再进人。
+ *
+ * 人数以 presence 层的实时活跃数为准（与列表展示口径一致），而不是核心里
+ * 异步回写的 memberCount 快照。selfId 是调用者自己持有的成员 id：若他本来
+ * 就算在线，重连时不应把自己当成新占用一个名额，否则满员房间里的在线成员
+ * 刷新一下页面就会被自己挤出去。
+ *
+ * 返回 null 表示可进入，否则返回可直接下发的错误响应。
+ */
+async function capacityBlock(
+  store: RoomStore,
+  room: WatchRoom,
+  now: number,
+  selfId?: string
+): Promise<RoomResponse | null> {
+  const cap = normalizeCapacity(room.maxMembers);
+  if (!cap) return null;
+
+  const presence = await store.getPresence(room.id, MEMBER_TIMEOUT_MS, 0);
+  let occupied = Math.max(0, Number(presence.count) || 0);
+  if (selfId) {
+    const self = await store.getMember(room.id, selfId);
+    const lastSeen = Number(self?.lastSeen) || 0;
+    if (lastSeen > 0 && now - lastSeen <= MEMBER_TIMEOUT_MS) {
+      occupied = Math.max(0, occupied - 1);
+    }
+  }
+  if (occupied >= cap) {
+    return fail(`观影室人数已满（上限 ${cap} 人）`);
+  }
+  return null;
 }
 
 function allowCountRefresh(roomId: string, now: number): boolean {
@@ -238,13 +303,8 @@ export async function handleRoomAction(
     const roomName = customNameValue || videoTitle;
     // 只有登录创建的持久房间才可以公开（临时房间无法在列表中持久展示）
     const publicAtCreate = input.persistent === true && input.isPublic === true;
-    const hostMember: RoomMember = {
-      id: memberId,
-      name,
-      joinedAt: now,
-      lastSeen: now,
-      syncMode: 'auto',
-    };
+    // 创建房间只落核心状态，不预置在线成员：房主 / 成员真正打开播放页并完成
+    // 第一次 sync 心跳后才计入在线人数，避免「房间刚建好、没人连接」却显示 1 人。
     const room: WatchRoom = {
       id,
       hostId: memberId,
@@ -262,7 +322,9 @@ export async function handleRoomAction(
       defaultSyncMode: 'auto',
       state: { playing: false, time: 0, updatedAt: now },
       members: [],
-      memberCount: 1,
+      memberCount: 0,
+      // 老客户端不传 maxMembers 时由服务端兜底，保证新房间默认就有上限
+      maxMembers: resolveCreateCapacity(input.maxMembers),
       seq: 0,
       rev: 1,
       createdAt: now,
@@ -270,13 +332,12 @@ export async function handleRoomAction(
     };
 
     await store.saveRoom(room);
-    await store.putMember(id, hostMember, ttlOf(room));
     await emitDrafts(store, room, [
       makeDraft('system', memberId, name, `${name} 创建了房间，等待伙伴加入`),
     ]);
     invalidateRoomsCache();
 
-    const presence = await presenceFor(store, room, [memberId]);
+    const presence = await presenceFor(store, room);
     const { events, latest } = await readEvents(store, id, 0);
     return {
       ok: true,
@@ -294,55 +355,79 @@ export async function handleRoomAction(
   if (action === 'hasPersistentRoom') {
     if (!identity.owner) return { ok: true, ...common };
     const rooms = await cachedListRooms(store);
+    const room = rooms.find((item) => item.owner === identity.owner);
+    if (!room) return { ok: true, ...common };
+    // 房间核心里的 memberCount 只是房主心跳异步回写的快照：上次连接断开后
+    // 没人再心跳，它不会自动归零，可能永远停在 1。播放页的「我的观影室」
+    // 卡片只读这个接口，若直接透传快照就会出现「没加入却显示 1 人在线」。
+    // 这里按 presence 实时统计覆盖，口径与 myRooms / publicRooms 一致。
+    const [count] = await liveCountsFor(store, [room]);
     return {
       ok: true,
-      room: rooms.find((item) => item.owner === identity.owner),
+      room: { ...room, memberCount: count },
       ...common,
     };
   }
 
   if (action === 'myRooms') {
     if (!identity.owner) return fail('请登录后查看自己的观影室');
-    const rooms = (await cachedListRooms(store)).filter(
-      (room) => room.owner === identity.owner
-    );
-    return { ok: true, rooms, ...common };
+    const source =
+      input.fresh === true
+        ? await freshListRooms(store, now)
+        : await cachedListRooms(store);
+    const rooms = source.filter((room) => room.owner === identity.owner);
+    const counts = await liveCountsFor(store, rooms);
+    return {
+      ok: true,
+      rooms: rooms.map((room, index) => ({
+        ...room,
+        memberCount: counts[index],
+      })),
+      ...common,
+    };
   }
 
   // 公开大厅：只返回展示所需字段，不暴露 owner、事件序号、成员明细。
-  // 人数用核心里由房主心跳维护的 memberCount，避免为列表里每个房间再查一次 presence。
+  // 在线人数按 presence 实时统计（已进入房间且心跳未超时的连接数），
+  // 不再依赖核心里由房主心跳异步回写的快照，保证刷新后拿到真实人数。
   if (action === 'publicRooms') {
-    const rooms = (await cachedListRooms(store))
+    const source =
+      input.fresh === true
+        ? await freshListRooms(store, now)
+        : await cachedListRooms(store);
+    const listed = source
       .filter((room) => room.isPublic === true && room.enabled !== false)
-      .sort((a, b) => (b.publicizedAt || 0) - (a.publicizedAt || 0))
-      .map(
-        (room): WatchRoom => ({
-          id: room.id,
-          hostId: '',
-          hostName: room.hostName,
-          persistent: true,
-          enabled: true,
-          isPublic: true,
-          publicizedAt: room.publicizedAt,
-          title: room.title,
-          customName: room.customName,
-          videoTitle: room.videoTitle,
-          playPath: room.playPath,
-          episode: room.episode,
-          defaultSyncMode: room.defaultSyncMode,
-          state: {
-            playing: false,
-            time: 0,
-            updatedAt: room.state?.updatedAt || now,
-          },
-          members: [],
-          memberCount: Number(room.memberCount) || 0,
-          seq: 0,
-          rev: room.rev,
-          createdAt: room.createdAt,
-          lastActiveAt: room.lastActiveAt,
-        })
-      );
+      .sort((a, b) => (b.publicizedAt || 0) - (a.publicizedAt || 0));
+    const counts = await liveCountsFor(store, listed);
+    const rooms = listed.map(
+      (room, index): WatchRoom => ({
+        id: room.id,
+        hostId: '',
+        hostName: room.hostName,
+        persistent: true,
+        enabled: true,
+        isPublic: true,
+        publicizedAt: room.publicizedAt,
+        title: room.title,
+        customName: room.customName,
+        videoTitle: room.videoTitle,
+        playPath: room.playPath,
+        episode: room.episode,
+        defaultSyncMode: room.defaultSyncMode,
+        state: {
+          playing: false,
+          time: 0,
+          updatedAt: room.state?.updatedAt || now,
+        },
+        members: [],
+        memberCount: counts[index],
+        maxMembers: normalizeCapacity(room.maxMembers),
+        seq: 0,
+        rev: room.rev,
+        createdAt: room.createdAt,
+        lastActiveAt: room.lastActiveAt,
+      })
+    );
     return { ok: true, rooms, ...common };
   }
 
@@ -415,6 +500,8 @@ export async function handleRoomAction(
       identity.name,
       action === 'enterOwned' ? input.name : room.hostName
     );
+    // 房主回到自己的房间不受人数上限限制：满员时也应能重新接管，
+    // 否则房主会被自己设置的容量挡在门外。
     let member = await store.getMember(room.id, room.hostId);
     let memberId: string;
     const drafts: EventDraft[] = [];
@@ -471,19 +558,46 @@ export async function handleRoomAction(
     if (room.enabled === false) {
       return fail('观影室已关闭，重新开启后才可继续使用');
     }
+    // 房主手动输自己的房间号也会走 join。以前这里一律新建普通成员：既会
+    // 被人数上限挡在门外，又会在下一轮 sync 触发重接管、留下占名额的僵尸记录。
+    // 现在识别创建者账号，直接复用 hostId 并豁免容量校验。
+    const isOwner = !!(
+      room.persistent &&
+      room.owner &&
+      identity.owner === room.owner
+    );
+    if (!isOwner) {
+      // 新建成员前先按实时在线人数卡上限，满了直接拒绝，不写入任何 presence
+      const blocked = await capacityBlock(store, room, now);
+      if (blocked) return blocked;
+    }
 
     const name = resolveName(identity.name, input.name);
-    const memberId = makeMemberId();
+    const memberId = isOwner && room.hostId ? room.hostId : makeMemberId();
+    // 正常房间创建时 hostId 一定非空；这里只为异常/迁移数据兜底，避免
+    // 房主进房后 isHost 判定与后续 sync 的 hostId 对不上。
+    if (isOwner && !room.hostId) {
+      room.hostId = memberId;
+      room.hostName = name;
+    }
+    const existing = isOwner ? await store.getMember(room.id, memberId) : null;
     const member: RoomMember = {
       id: memberId,
       name,
-      joinedAt: now,
+      joinedAt: Number(existing?.joinedAt) || now,
       lastSeen: now,
-      syncMode: normalizeSyncMode(room.defaultSyncMode || 'auto'),
+      syncMode: normalizeSyncMode(
+        existing?.syncMode ?? room.defaultSyncMode ?? 'auto'
+      ),
     };
     await store.putMember(room.id, member, ttlOf(room));
     await emitDrafts(store, room, [
-      makeDraft('system', memberId, name, `${name} 加入了房间`),
+      makeDraft(
+        'system',
+        memberId,
+        name,
+        isOwner ? `${name} 作为房主进入观影室` : `${name} 加入了房间`
+      ),
     ]);
     const presence = await presenceFor(store, room, [memberId]);
     room.memberCount = presence.count;
@@ -496,7 +610,7 @@ export async function handleRoomAction(
       room: toView(room, presence, latest),
       events,
       memberId,
-      isHost: false,
+      isHost: isOwner,
       memberCount: presence.count,
       mySyncMode: member.syncMode,
       rev: room.rev,
@@ -525,33 +639,77 @@ export async function handleRoomAction(
       member = null;
     }
     let rejoined = false;
+    // 提前声明：房主重接管会改 hostId / hostName，必须能在这里标脏。否则刚进
+    // 播放页、播放器尚未 ready（无 local 上报）且人数没变的前几轮根本不落盘，
+    // 下一轮读到的还是旧 hostId，于是每轮都重接管、事件刷屏。
+    let coreChanged = false;
 
-    // 持久房间创建者重新接管房主身份
+    // 持久房间创建者重新接管房主身份。
+    // 同一账号的多标签页 / 多设备互相读不到对方的 memberId（sessionStorage
+    // 按标签页隔离），若一上来就无条件抢占 hostId，两个连接会按轮询节奏
+    // 交替互踢。因此只有「旧房主确认离线」才真正接管；仍在线时直接复用
+    // 当前 hostId，让多个连接共用同一房主席位。
     if (room.persistent && room.owner && identity.owner === room.owner) {
       if (!member || member.id !== room.hostId) {
-        const oldHostId = room.hostId;
-        memberId = makeMemberId();
-        member = {
-          id: memberId,
-          name: resolveName(identity.name, input.name),
-          joinedAt: now,
-          lastSeen: now,
-          syncMode: normalizeSyncMode(room.defaultSyncMode ?? 'auto'),
-        };
-        if (oldHostId && oldHostId !== memberId) {
-          await store.removeMember(roomId, oldHostId);
+        const hostMember = room.hostId
+          ? await store.getMember(roomId, room.hostId)
+          : null;
+        const hostLastSeen = Number(hostMember?.lastSeen) || 0;
+        const hostOnline =
+          !!hostMember &&
+          hostLastSeen > 0 &&
+          now - hostLastSeen <= MEMBER_TIMEOUT_MS;
+
+        if (hostOnline && room.hostId && hostMember) {
+          // 复用房主席位：不删在线记录、不改 hostId、不刷「加入了房间」。
+          // 两个连接共用同一 memberId 时 presence 只算 1 人，任一方心跳续期。
+          const staleId = cleanText(input.memberId, 64);
+          if (staleId && staleId !== room.hostId) {
+            // 本次连接已放弃这个旧 id，直接清掉，避免它白占一个名额 20 秒。
+            // 共用同一旧 id 的其他连接下一轮同样会复用 hostId，删除是安全的。
+            await store.removeMember(roomId, staleId);
+          }
+          memberId = room.hostId;
+          member = hostMember;
+          member.name = resolveName(identity.name, input.name);
+        } else {
+          // 旧房主确认离线（或记录已失效）才接管
+          const oldHostId = room.hostId;
+          memberId = makeMemberId();
+          member = {
+            id: memberId,
+            name: resolveName(identity.name, input.name),
+            joinedAt: now,
+            lastSeen: now,
+            syncMode: normalizeSyncMode(room.defaultSyncMode ?? 'auto'),
+          };
+          if (oldHostId && oldHostId !== memberId) {
+            await store.removeMember(roomId, oldHostId);
+          }
+          room.hostId = memberId;
+          room.hostName = member.name;
+          coreChanged = true;
+          rejoined = true;
         }
-        room.hostId = memberId;
-        room.hostName = member.name;
-        rejoined = true;
       }
     } else if (room.persistent && room.owner) {
       // 只能由持久房间创建账号掌控房主身份，普通成员不能继承离线房主权限。
       if (memberId === room.hostId && !member) memberId = '';
     }
 
-    // 自愈：房间重启 / 存储换实例后，旧的 memberId 可能已失效
+    // 自愈：房间重启 / 存储换实例后，旧的 memberId 可能已失效。
+    // 邀请链接自动入房走的也是这条路径，所以必须在重新分配成员 id 之前
+    // 卡一次容量，否则被拒绝的用户下一轮心跳又会悄悄挤进房间。
+    // 前面「持久房间创建者重新接管房主身份」的分支不受此限制，房主永远
+    // 能回到自己的房间。
     if (!member) {
+      const blocked = await capacityBlock(
+        store,
+        room,
+        now,
+        memberId || undefined
+      );
+      if (blocked) return blocked;
       memberId = makeMemberId();
       member = {
         id: memberId,
@@ -572,7 +730,6 @@ export async function handleRoomAction(
 
     // 一次读取完成：超时清扫 + 精确人数 + 裁剪后的名单预览
     const presence = await presenceFor(store, room, [memberId]);
-    let coreChanged = false;
 
     const normalizedDefault = normalizeSyncMode(room.defaultSyncMode ?? 'auto');
     if (room.defaultSyncMode !== normalizedDefault) {
@@ -834,14 +991,18 @@ export async function handleRoomAction(
     const member = await store.getMember(roomId, cleanText(input.memberId, 64));
     if (!member) return { ok: true, ...common };
 
-    await store.removeMember(roomId, member.id);
-    const presence = await presenceFor(store, room);
-
+    // 房主可能与同一账号的其他标签页 / 设备共用 hostId（见 sync 的席位复用）。
+    // 服务端无从判断还有几个连接在用这个 id，因此房主主动离开时保留在线记录，
+    // 让它随心跳超时自然清扫，避免关掉一个标签页把其他连接一起注销。
     if (room.persistent && member.id === room.hostId) {
+      const presence = await presenceFor(store, room);
       room.memberCount = presence.count;
       await saveCore(store, room);
       return { ok: true, ...common };
     }
+
+    await store.removeMember(roomId, member.id);
+    const presence = await presenceFor(store, room);
 
     if (presence.count === 0) {
       if (room.persistent) {
